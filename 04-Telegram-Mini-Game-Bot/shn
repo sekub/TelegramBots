@@ -1,0 +1,427 @@
+import json
+import logging
+from datetime import datetime, timezone
+from typing import Dict, Any
+import csv
+import time
+from collections import defaultdict
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    __version__ as TG_VER,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    CallbackQueryHandler,
+    ContextTypes,
+    ConversationHandler,
+)
+import asyncio
+
+# ===== CONFIGURATION SECTION =====
+BOT_TOKEN = '8186874433:AAGlMY7eV6DNlZw794hz6mMkpLODi23KqmA'
+OWNER_ID = 7403487121
+DATA_FILE = 'users.json'
+LOG_FILE = 'bot.log'
+RATE_LIMIT_SECONDS = 3  # seconds between clicks/commands for same user
+
+# Conversation state for owner reply and broadcast
+WAITING_FOR_REPLY_MESSAGE = 1
+WAITING_FOR_BROADCAST_MESSAGE = 2
+
+# States
+WAITING_FOR_REPLY_MESSAGE, WAITING_FOR_BROADCAST_MESSAGE = range(2)
+reply_target = {}
+
+START_TIME = time.time()
+
+# ===== LOGGER SETUP =====
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ===== DATA HANDLING =====
+def load_data() -> Dict[str, Any]:
+    try:
+        with open(DATA_FILE, 'r') as f:
+            data = json.load(f)
+        logger.info("Loaded user data successfully.")
+        return data
+    except (FileNotFoundError, json.JSONDecodeError):
+        logger.warning("User data file missing or corrupted. Initializing empty data.")
+        return {}
+
+def save_data(data: Dict[str, Any]):
+    with open(DATA_FILE, 'w') as f:
+        json.dump(data, f, indent=4)
+    logger.info("User data saved.")
+
+# ===== RATE LIMITING =====
+user_last_command_time = {}
+
+def rate_limit(user_id: int) -> bool:
+    now = datetime.now().timestamp()
+    last = user_last_command_time.get(user_id, 0)
+    if now - last < RATE_LIMIT_SECONDS:
+        return False
+    user_last_command_time[user_id] = now
+    return True
+
+# === Utility ===
+def get_uptime():
+    seconds = int(time.time() - START_TIME)
+    return str(datetime.timedelta(seconds=seconds))
+
+# ===== COMMAND HANDLERS =====
+
+async def send_help_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    is_owner = (user_id == OWNER_ID)
+    if is_owner:
+        help_text = (
+            "👑 <b>Owner Command List</b> 👑\n\n"
+            "/start - Show user stats report\n"
+            "/status - List all users and their subscription status\n"
+            "/broadcast - Send announcement to all subscribed users\n"
+            "R <user_id> - Reply to a user\n"
+            "/cancel - Cancel reply or broadcast\n"
+            "/exportjson - Export user data as JSON\n"
+            "/exportcsv - Export user data as CSV\n"
+            "/help - Show this help message\n"
+            "\nUse <code>R user_id</code> then send the message to reply to that user."
+        )
+    else:
+        help_text = (
+            "👋 <b>Luncher Bot Usage Guide</b>\n\n"
+            "/start - Register and see welcome message\n"
+            "/shn - Go to SHN section and subscribe for event notifications\n"
+            "/myinfo - Show your registration and notification status\n"
+            "/unsubscribe - Opt out from notifications\n"
+            "/help - Show this message\n\n"
+            "⚠️ You can only subscribe once. Trying again will notify you that you are already subscribed."
+        )
+    await update.message.reply_html(help_text)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_id_str = str(user.id)
+    username = user.username or "NoUsername"
+    name = user.first_name or "User"
+    is_owner = (user.id == OWNER_ID)
+
+    if not rate_limit(user.id):
+        await update.message.reply_text("⏳ Please wait a moment before using commands again.")
+        return
+
+    data = load_data()
+
+    if is_owner:
+        total_users = len(data)
+        today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        today_count = sum(1 for u in data.values() if u.get('start_date') == today_str)
+        report = (
+            f"📊 <b>Luncher Bot Owner Dashboard</b> 📊\n\n"
+            f"👥 Total users: <b>{total_users}</b>\n"
+            f"🆕 New users today: <b>{today_count}</b>\n\n"
+            f"Use /status to see user list.\n"
+            f"Reply to users: send <code>R user_id</code>.\n"
+            f"Use /broadcast to send announcements.\n"
+            f"Use /exportjson or /exportcsv to export data.\n"
+            f"Send /help for all commands."
+        )
+        await update.message.reply_html(report)
+        logger.info("Owner requested start dashboard.")
+        return
+
+    if user_id_str not in data:
+        today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        data[user_id_str] = {
+            "username": username,
+            "name": name,
+            "status": "OFF",
+            "start_date": today_str
+        }
+        save_data(data)
+        await context.bot.send_message(
+            chat_id=OWNER_ID,
+            text=(
+                f"🆕 New user registered:\n"
+                f"👤 Username: @{username}\n"
+                f"🆔 User ID: {user_id_str}\n"
+                f"👥 Total users: {len(data)}"
+            )
+        )
+        logger.info(f"Registered new user: @{username} ({user_id_str})")
+
+    user_data = context.user_data
+    if not user_data.get('welcomed'):
+        welcome_text = (
+            f"👋 Hi {name}!\n"
+            "Welcome to <b>Luncher Bot</b>!\n\n"
+            "You can:\n"
+            "• Send /shn to go to SHN section.\n"
+            "• Click 'Get Notify' button there to subscribe for notifications.\n"
+            "• Use /myinfo to check your subscription status.\n"
+            "• Use /unsubscribe to stop notifications.\n"
+            "• Use /help for this guide anytime.\n\n"
+            "⚠️ You can only subscribe once. Trying again will show a message.\n"
+            "Enjoy!"
+        )
+        await update.message.reply_html(welcome_text)
+        user_data['welcomed'] = True
+    else:
+        await update.message.reply_text("You have already started. Use /help for commands.")
+
+async def shn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not rate_limit(update.effective_user.id):
+        await update.message.reply_text("⏳ Please wait a moment before using commands again.")
+        return
+
+    keyboard = [
+        [InlineKeyboardButton("Get Notify 🔔", callback_data='get_notify')],
+        [InlineKeyboardButton("Help / How to Use ❓", callback_data='help')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        "⚡ Welcome to the SHN section! Click 'Get Notify' to subscribe to event notifications.\n\n"
+        "You will only be able to subscribe once.\n"
+        "Click 'Help / How to Use' for guidance.",
+        reply_markup=reply_markup
+    )
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    user_id_str = str(user.id)
+    username = user.username or "NoUsername"
+
+    await query.answer()
+
+    data = load_data()
+
+    if query.data == 'get_notify':
+        if user_id_str not in data:
+            await query.edit_message_text("❗ Please send /start first to register.")
+            return
+        if data[user_id_str].get('status') == 'ON':
+            await query.edit_message_text("✅ You are already subscribed to notifications.")
+            return
+
+        data[user_id_str]['status'] = 'ON'
+        save_data(data)
+
+        await query.edit_message_text("👍 Thanks! You will be notified when events start.")
+
+        await context.bot.send_message(
+            chat_id=OWNER_ID,
+            text=f"🔔 User subscribed:\n👤 @{username}\n🆔 {user_id_str}\nUSERSTATUS: ON"
+        )
+        logger.info(f"User @{username} ({user_id_str}) subscribed for notifications.")
+        return
+
+    elif query.data == 'help':
+        help_text = (
+            "ℹ️ <b>How to Use Luncher Bot</b>\n\n"
+            "• /start - Register with the bot.\n"
+            "• /shn - Enter SHN section and subscribe.\n"
+            "• Click 'Get Notify' once to get event notifications.\n"
+            "• /myinfo - Check your subscription status.\n"
+            "• /unsubscribe - Stop notifications.\n"
+            "• Owner manages users and can reply to you.\n"
+            "Enjoy!"
+        )
+        await query.edit_message_text(help_text, parse_mode='HTML')
+
+async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_id_str = str(user.id)
+    data = load_data()
+
+    if user_id_str not in data:
+        await update.message.reply_text("❗ You are not registered. Please send /start first.")
+        return
+
+    if data[user_id_str].get('status') == 'OFF':
+        await update.message.reply_text("ℹ️ You are already unsubscribed.")
+        return
+
+    data[user_id_str]['status'] = 'OFF'
+    save_data(data)
+    await update.message.reply_text("✅ You have been unsubscribed from notifications.")
+
+    await context.bot.send_message(
+        chat_id=OWNER_ID,
+        text=f"⚠️ User unsubscribed:\n👤 @{data[user_id_str].get('username','NoUsername')}\n🆔 {user_id_str}\nUSERSTATUS: OFF"
+    )
+    logger.info(f"User {user_id_str} unsubscribed.")
+
+async def myinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_id_str = str(user.id)
+    data = load_data()
+
+    if user_id_str not in data:
+        await update.message.reply_text("❗ You are not registered. Please send /start first.")
+        return
+
+    user_info = data[user_id_str]
+    status = user_info.get('status', 'OFF')
+    start_date = user_info.get('start_date', 'Unknown')
+
+    info_text = (
+        f"👤 Your Info:\n"
+        f"Username: @{user.username or 'NoUsername'}\n"
+        f"User ID: {user_id_str}\n"
+        f"Subscribed for notifications: <b>{status}</b>\n"
+        f"Started on: {start_date}"
+    )
+    await update.message.reply_html(info_text)
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("❌ You are not authorized to use this command.")
+        return
+
+    data = load_data()
+    if not data:
+        await update.message.reply_text("No users registered yet.")
+        return
+
+    lines = ["📋 <b>User Status List</b>:"]
+    for uid, info in data.items():
+        username = info.get('username', 'NoUsername')
+        status = info.get('status', 'OFF')
+        lines.append(f"👤 @{username} — ID: {uid} — Status: <b>{status}</b>")
+
+    report = "\n".join(lines)
+    await update.message.reply_html(report)
+
+# === Additional Owner/Admin Features ===
+
+async def exportjson(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    try:
+        with open(DATA_FILE, 'rb') as f:
+            await update.message.reply_document(document=f, filename=DATA_FILE)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to send JSON: {e}")
+
+async def exportcsv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    data = load_data()
+    with open('users.csv', 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['ID', 'Name', 'Username', 'Status', 'StartDate'])
+        for uid, info in data.items():
+            writer.writerow([uid, info['name'], info['username'], info['status'], info['start_date']])
+    with open('users.csv', 'rb') as f:
+        await update.message.reply_document(f, filename='users.csv')
+
+async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    uptime = get_uptime()
+    data = load_data()
+    await update.message.reply_text(
+        f"🔧 Bot Health Check:\n\n⏱️ Uptime: {uptime}\n👥 Users: {len(data)}\n📡 Status: ONLINE"
+    )
+
+async def reply_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text("Usage: R <user_id>")
+        return
+    uid = context.args[0]
+    reply_target[OWNER_ID] = uid
+    await update.message.reply_text("✏️ Send me the message to send to the user.")
+    return WAITING_FOR_REPLY_MESSAGE
+
+async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message.text
+    uid = reply_target.pop(OWNER_ID, None)
+    if uid:
+        try:
+            await context.bot.send_message(chat_id=int(uid), text=message)
+            await update.message.reply_text("✅ Message sent to user.")
+        except:
+            await update.message.reply_text("❌ Failed to send message.")
+    return ConversationHandler.END
+
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    broadcast_mode[update.effective_user.id] = True
+    await update.message.reply_text("📢 Send the message to broadcast to all users with status ON.")
+    return WAITING_FOR_BROADCAST_MESSAGE
+
+async def handle_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message.text
+    data = load_data()
+    success = 0
+    fail = 0
+    for uid, info in data.items():
+        if info.get('status') == 'ON':
+            try:
+                await context.bot.send_message(chat_id=int(uid), text=message)
+                success += 1
+            except:
+                fail += 1
+    await update.message.reply_text(f"✅ Broadcast complete!\nSuccess: {success}\nFailed: {fail}")
+    return ConversationHandler.END
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reply_target.pop(OWNER_ID, None)
+    await update.message.reply_text("❌ Operation cancelled.")
+    return ConversationHandler.END
+
+# === Main ===
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler('start', start))
+    app.add_handler(CommandHandler('shn', shn))
+    app.add_handler(CommandHandler('unsubscribe', unsubscribe))
+    app.add_handler(CommandHandler('myinfo', myinfo))
+    app.add_handler(CommandHandler('status', status))
+    app.add_handler(CommandHandler('help', send_help_message))
+    app.add_handler(CommandHandler('exportjson', exportjson))
+    app.add_handler(CommandHandler('exportcsv', exportcsv))
+    app.add_handler(CommandHandler('cancel', cancel))
+    app.add_handler(CommandHandler('R', reply_command))
+    app.add_handler(CommandHandler('broadcast', broadcast_command))
+    app.add_handler(CommandHandler('health', health))
+
+    app.add_handler(CallbackQueryHandler(button_handler))
+
+    conv_handler = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.TEXT & filters.User(user_id=OWNER_ID), handle_reply),
+            MessageHandler(filters.TEXT & filters.User(user_id=OWNER_ID), handle_broadcast)
+        ],
+        states={
+            WAITING_FOR_REPLY_MESSAGE: [MessageHandler(filters.TEXT, handle_reply)],
+            WAITING_FOR_BROADCAST_MESSAGE: [MessageHandler(filters.TEXT, handle_broadcast)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)]
+    )
+    app.add_handler(conv_handler)
+
+    print("🚀 Super Advanced Luncher Bot is running...")
+    app.run_polling()
+
+if __name__ == '__main__':
+    main()
